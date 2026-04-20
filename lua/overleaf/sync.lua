@@ -502,34 +502,32 @@ function M._find_new_files(state)
       local name, ftype = vim.uv.fs_scandir_next(handle)
       if not name then break end
 
-      -- Skip hidden files/directories
-      if name:match('^%.') then goto next end
+      if not name:match('^%.') then
+        local abs_path = dir .. '/' .. name
+        local rel_path = prefix .. name
 
-      local abs_path = dir .. '/' .. name
-      local rel_path = prefix .. name
+        -- fs_scandir may not return type on some filesystems; use stat as fallback
+        if not ftype then
+          local stat = vim.uv.fs_stat(abs_path)
+          if stat then ftype = stat.type end
+        end
 
-      -- fs_scandir may not return type on some filesystems; use stat as fallback
-      if not ftype then
-        local stat = vim.uv.fs_stat(abs_path)
-        if stat then ftype = stat.type end
-      end
-
-      if ftype == 'directory' then
-        scan_dir(abs_path, rel_path .. '/')
-      elseif ftype == 'file' then
-        if not known_paths[rel_path] then
-          local ext = name:match('%.([^%.]+)$')
-          if ext and text_exts[ext] then
-            table.insert(new_files, { path = rel_path, abs_path = abs_path })
+        if ftype == 'directory' then
+          scan_dir(abs_path, rel_path .. '/')
+        elseif ftype == 'file' then
+          if not known_paths[rel_path] then
+            local ext = name:match('%.([^%.]+)$')
+            if ext and text_exts[ext] then
+              table.insert(new_files, { path = rel_path, abs_path = abs_path })
+            end
           end
         end
       end
-
-      ::next::
     end
   end
 
   scan_dir(M._sync_dir, '')
+  config.log('debug', 'Scanned %s: found %d new file(s)', M._sync_dir, #new_files)
   return new_files
 end
 
