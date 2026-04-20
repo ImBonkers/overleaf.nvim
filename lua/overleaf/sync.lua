@@ -453,11 +453,211 @@ function M.import_all(state)
     end
   end
 
-  if changed == 0 then
+  -- Detect new files on disk that don't exist in the project
+  local new_files = M._find_new_files(state)
+  if #new_files > 0 then
+    config.log('info', 'Found %d new file(s) to create on Overleaf', #new_files)
+    M._create_new_docs(state, new_files)
+  end
+
+  if changed == 0 and #new_files == 0 then
     config.log('info', 'No external changes detected')
-  else
+  elseif changed > 0 then
     config.log('info', 'Importing %d changed file(s)', changed)
   end
+end
+
+--- Scan sync directory for files not tracked by the project
+---@param state table
+---@return table[] list of {path=relative_path, abs_path=full_path}
+function M._find_new_files(state)
+  if not M._sync_dir then return {} end
+
+  local project = require('overleaf.project')
+  local new_files = {}
+
+  -- Build set of known document paths for fast lookup
+  local known_paths = {}
+  for _, doc in pairs(state.documents) do
+    known_paths[doc.path] = true
+  end
+  for _, entry in ipairs(project._project_tree) do
+    known_paths[entry.path] = true
+  end
+
+  -- Recursively scan sync directory
+  local function scan_dir(dir, prefix)
+    local handle = vim.uv.fs_scandir(dir)
+    if not handle then return end
+
+    while true do
+      local name, ftype = vim.uv.fs_scandir_next(handle)
+      if not name then break end
+
+      local abs_path = dir .. '/' .. name
+      local rel_path = prefix .. name
+
+      if ftype == 'directory' then
+        scan_dir(abs_path, rel_path .. '/')
+      elseif ftype == 'file' then
+        -- Skip hidden files and non-text extensions that Overleaf doesn't handle as docs
+        if not name:match('^%.') and not known_paths[rel_path] then
+          -- Only import text-like files as documents
+          local ext = name:match('%.([^%.]+)$')
+          local text_exts = { tex = true, sty = true, cls = true, bib = true, bbl = true, txt = true, md = true }
+          if ext and text_exts[ext] then
+            table.insert(new_files, { path = rel_path, abs_path = abs_path })
+          end
+        end
+      end
+    end
+  end
+
+  scan_dir(M._sync_dir, '')
+  return new_files
+end
+
+--- Create new documents on Overleaf for files found on disk
+---@param state table
+---@param new_files table[] from _find_new_files
+function M._create_new_docs(state, new_files)
+  local project = require('overleaf.project')
+
+  for _, file_info in ipairs(new_files) do
+    local f = io.open(file_info.abs_path, 'r')
+    if not f then goto continue end
+    local content = f:read('*a')
+    f:close()
+
+    -- Determine parent folder and doc name
+    local parent_path = file_info.path:match('^(.*/)') or ''
+    local doc_name = file_info.path:match('[^/]+$')
+
+    -- Find or create parent folder ID
+    local parent_folder_id = nil
+    if parent_path ~= '' then
+      parent_folder_id = M._ensure_folders(state, parent_path)
+    end
+
+    config.log('info', 'Creating on Overleaf: %s', file_info.path)
+
+    bridge.request('createDoc', {
+      cookie = config.get().cookie,
+      csrfToken = state.csrf_token,
+      projectId = state.project_id,
+      name = doc_name,
+      parentFolderId = parent_folder_id,
+    }, function(err, result)
+      if err then
+        config.log('error', 'Failed to create doc %s: %s', file_info.path, err.message or '')
+        return
+      end
+
+      local doc_id = result._id or result.id
+      config.log('info', 'Created: %s (id=%s)', file_info.path, doc_id)
+
+      -- Add to project tree
+      project.add_entry({
+        id = doc_id,
+        name = doc_name,
+        path = file_info.path,
+        type = 'doc',
+        depth = select(2, file_info.path:gsub('/', '')) or 0,
+      })
+
+      -- Create document instance and sync content
+      local Document = require('overleaf.document')
+      local doc = Document.new(doc_id, file_info.path)
+      state.documents[doc_id] = doc
+
+      -- If file has content, push it to Overleaf via OT
+      if content and #content > 0 then
+        M._sync_closed_doc(doc, content)
+      else
+        -- Empty file, just set up state
+        doc.content = ''
+        doc.server_content = ''
+        doc.version = 0
+      end
+
+      -- Start watching the new file
+      M.watch(doc)
+
+      -- Refresh tree UI
+      vim.schedule(function() require('overleaf.tree').refresh() end)
+    end)
+
+    ::continue::
+  end
+end
+
+--- Ensure all folders in a path exist on Overleaf, creating them if needed.
+--- Returns the folder ID of the deepest folder.
+---@param state table
+---@param folder_path string e.g. "chapters/intro/"
+---@return string|nil folder_id
+function M._ensure_folders(state, folder_path)
+  local project = require('overleaf.project')
+
+  -- Split path into components
+  local parts = {}
+  for part in folder_path:gmatch('([^/]+)') do
+    table.insert(parts, part)
+  end
+
+  local current_path = ''
+  local parent_id = nil
+
+  for _, part in ipairs(parts) do
+    current_path = current_path .. part .. '/'
+
+    -- Check if folder already exists in project tree
+    local found = false
+    for _, entry in ipairs(project._project_tree) do
+      if entry.path == current_path and entry.type == 'folder' then
+        parent_id = entry.id
+        found = true
+        break
+      end
+    end
+
+    if not found then
+      -- Create folder synchronously (blocking) so we can chain parent IDs
+      -- Use a coroutine-style approach: fire request and store result
+      local folder_id = nil
+      local done = false
+
+      bridge.request('createFolder', {
+        cookie = config.get().cookie,
+        csrfToken = state.csrf_token,
+        projectId = state.project_id,
+        name = part,
+        parentFolderId = parent_id,
+      }, function(err, result)
+        if err then
+          config.log('error', 'Failed to create folder %s: %s', current_path, err.message or '')
+        else
+          folder_id = result._id or result.id
+          project.add_entry({
+            id = folder_id,
+            name = part,
+            path = current_path,
+            type = 'folder',
+            depth = select(2, current_path:gsub('/', '')) - 1,
+          })
+        end
+        done = true
+      end)
+
+      -- Wait for the folder creation to complete (bridge is async via libuv)
+      vim.wait(5000, function() return done end, 50)
+
+      if not folder_id then return parent_id end
+      parent_id = folder_id
+    end
+  end
+
+  return parent_id
 end
 
 --- Export: write all open documents to disk
