@@ -159,6 +159,17 @@ end
 ---@param path string local file path
 ---@param doc table Document instance
 function M._on_file_changed(path, doc)
+  -- Re-register watcher (fs_event can be one-shot on some platforms)
+  local w = M._watchers[path]
+  if w and w.handle and not w.handle:is_closing() then
+    w.handle:stop()
+    w.handle:start(path, {}, function(err, _, _)
+      if err then return end
+      if M._writing[path] then return end
+      vim.schedule(function() M._on_file_changed(path, doc) end)
+    end)
+  end
+
   local f = io.open(path, 'r')
   if not f then return end
   local new_content = f:read('*a')
@@ -170,9 +181,30 @@ function M._on_file_changed(path, doc)
   config.log('info', 'External change: %s', doc.path)
 
   if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-    -- Doc is open in Neovim: replace buffer content (triggers on_bytes → OT)
+    -- Doc is open in Neovim: build OT ops manually and update buffer
+    -- without relying on on_bytes (which would use stale doc.content)
+    local old_content = doc.content
+
+    -- Suppress on_bytes from firing during our buffer update
+    doc.applying_remote = true
+    M._writing[path] = true
+
     local lines = vim.split(new_content, '\n', { plain = true })
     vim.api.nvim_buf_set_lines(doc.bufnr, 0, -1, false, lines)
+
+    doc.applying_remote = false
+    vim.defer_fn(function() M._writing[path] = nil end, 300)
+
+    -- Build OT ops: delete old content, insert new content
+    local ops = {}
+    if #old_content > 0 then table.insert(ops, { p = 0, d = old_content }) end
+    if #new_content > 0 then table.insert(ops, { p = 0, i = new_content }) end
+
+    -- Update doc.content BEFORE submitting ops so check_content won't diverge
+    doc.content = new_content
+
+    -- Submit OT ops to Overleaf
+    doc:submit_op(ops)
   else
     -- Doc is NOT open: join, send OT ops directly, leave
     M._sync_closed_doc(doc, new_content)
@@ -211,6 +243,12 @@ function M._sync_closed_doc(doc, new_content)
     }, function(ot_err, _)
       if ot_err then
         config.log('error', 'Sync OT failed for %s: %s', doc.path, ot_err.message)
+        -- Write server content back to disk so the file doesn't stay diverged
+        -- from what Overleaf has (prevents repeated failed sync attempts)
+        doc.content = server_content
+        doc.server_content = server_content
+        doc.version = version
+        M.write_doc(doc)
       else
         config.log('info', 'Synced external change: %s', doc.path)
         -- Update doc state
@@ -389,8 +427,25 @@ function M.import_all(state)
       if disk_content ~= doc.content then
         changed = changed + 1
         if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+          local old_content = doc.content
+
+          -- Suppress on_bytes during buffer update
+          doc.applying_remote = true
+          M._writing[path] = true
+
           local lines = vim.split(disk_content, '\n', { plain = true })
           vim.api.nvim_buf_set_lines(doc.bufnr, 0, -1, false, lines)
+
+          doc.applying_remote = false
+          vim.defer_fn(function() M._writing[path] = nil end, 300)
+
+          -- Build and submit OT ops manually
+          local ops = {}
+          if #old_content > 0 then table.insert(ops, { p = 0, d = old_content }) end
+          if #disk_content > 0 then table.insert(ops, { p = 0, i = disk_content }) end
+
+          doc.content = disk_content
+          doc:submit_op(ops)
         else
           M._sync_closed_doc(doc, disk_content)
         end
