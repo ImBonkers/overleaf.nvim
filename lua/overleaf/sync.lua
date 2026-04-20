@@ -457,11 +457,14 @@ function M.import_all(state)
   local new_files = M._find_new_files(state)
   if #new_files > 0 then
     config.log('info', 'Found %d new file(s) to create on Overleaf', #new_files)
+    for _, nf in ipairs(new_files) do
+      config.log('info', '  + %s', nf.path)
+    end
     M._create_new_docs(state, new_files)
   end
 
   if changed == 0 and #new_files == 0 then
-    config.log('info', 'No external changes detected')
+    config.log('info', 'No external changes detected (scanned %s)', M._sync_dir)
   elseif changed > 0 then
     config.log('info', 'Importing %d changed file(s)', changed)
   end
@@ -517,8 +520,10 @@ function M._find_new_files(state)
         elseif ftype == 'file' then
           if not known_paths[rel_path] then
             local ext = name:match('%.([^%.]+)$')
-            if ext and text_exts[ext] then
+            if not ext or text_exts[ext] then
               table.insert(new_files, { path = rel_path, abs_path = abs_path })
+            else
+              config.log('debug', 'Skipping non-text file: %s (ext=%s)', rel_path, ext)
             end
           end
         end
