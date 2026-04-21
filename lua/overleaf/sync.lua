@@ -424,7 +424,12 @@ function M.import_all(state)
       local disk_content = f:read('*a')
       f:close()
 
-      if disk_content ~= doc.content then
+      -- Compare against server_content (what Overleaf acknowledged), not doc.content.
+      -- The file watcher may have already updated doc.content locally without the
+      -- OT ops reaching the server, so doc.content can match disk while the server
+      -- still has the old content.
+      local compare_to = doc.server_content or doc.content
+      if disk_content ~= compare_to then
         changed = changed + 1
         if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
           local old_content = doc.content
