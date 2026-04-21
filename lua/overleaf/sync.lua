@@ -131,12 +131,21 @@ function M.watch(doc)
 
   M._watchers[path] = { handle = handle, doc_id = doc.doc_id }
 
-  handle:start(path, {}, function(err, _, _)
+  local function on_event(err, _, _)
+    -- Re-register watcher immediately (fs_event can be one-shot on some platforms).
+    -- Must happen even for suppressed events, otherwise the watcher dies.
+    if handle and not handle:is_closing() then
+      handle:stop()
+      handle:start(path, {}, on_event)
+    end
+
     if err then return end
     if M._writing[path] then return end
 
     vim.schedule(function() M._on_file_changed(path, doc) end)
-  end)
+  end
+
+  handle:start(path, {}, on_event)
 end
 
 --- Stop watching a specific document's file
@@ -159,17 +168,6 @@ end
 ---@param path string local file path
 ---@param doc table Document instance
 function M._on_file_changed(path, doc)
-  -- Re-register watcher (fs_event can be one-shot on some platforms)
-  local w = M._watchers[path]
-  if w and w.handle and not w.handle:is_closing() then
-    w.handle:stop()
-    w.handle:start(path, {}, function(err, _, _)
-      if err then return end
-      if M._writing[path] then return end
-      vim.schedule(function() M._on_file_changed(path, doc) end)
-    end)
-  end
-
   local f = io.open(path, 'r')
   if not f then return end
   local new_content = f:read('*a')
