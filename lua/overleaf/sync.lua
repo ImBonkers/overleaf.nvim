@@ -414,7 +414,10 @@ function M.import_all(state)
     return
   end
 
-  local changed = 0
+  -- Force-sync every document from disk to Overleaf, regardless of local state.
+  -- Each doc is joined fresh to get the true server content, then OT ops are sent
+  -- if the disk content differs.
+  local synced = 0
   for _, doc in pairs(state.documents) do
     local path = M._sync_dir .. '/' .. doc.path
     local f = io.open(path, 'r')
@@ -422,37 +425,22 @@ function M.import_all(state)
       local disk_content = f:read('*a')
       f:close()
 
-      -- Compare against server_content (what Overleaf acknowledged), not doc.content.
-      -- The file watcher may have already updated doc.content locally without the
-      -- OT ops reaching the server, so doc.content can match disk while the server
-      -- still has the old content.
-      local compare_to = doc.server_content or doc.content
-      if disk_content ~= compare_to then
-        changed = changed + 1
-        if doc.joined and doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
-          local old_content = doc.content
+      synced = synced + 1
 
-          -- Suppress on_bytes during buffer update
-          doc.applying_remote = true
-          M._writing[path] = true
-
-          local lines = vim.split(disk_content, '\n', { plain = true })
-          vim.api.nvim_buf_set_lines(doc.bufnr, 0, -1, false, lines)
-
-          doc.applying_remote = false
-          vim.defer_fn(function() M._writing[path] = nil end, 300)
-
-          -- Build and submit OT ops manually
-          local ops = {}
-          if #old_content > 0 then table.insert(ops, { p = 0, d = old_content }) end
-          if #disk_content > 0 then table.insert(ops, { p = 0, i = disk_content }) end
-
-          doc.content = disk_content
-          doc:submit_op(ops)
-        else
-          M._sync_closed_doc(doc, disk_content)
-        end
+      -- Update buffer if open
+      if doc.bufnr and vim.api.nvim_buf_is_valid(doc.bufnr) then
+        doc.applying_remote = true
+        M._writing[path] = true
+        local lines = vim.split(disk_content, '\n', { plain = true })
+        vim.api.nvim_buf_set_lines(doc.bufnr, 0, -1, false, lines)
+        doc.applying_remote = false
+        vim.defer_fn(function() M._writing[path] = nil end, 300)
       end
+
+      -- Always push via the closed-doc path: join fresh, compare to actual
+      -- server content, send OT ops if different, leave.
+      doc.content = disk_content
+      M._sync_closed_doc(doc, disk_content)
     end
   end
 
@@ -466,11 +454,7 @@ function M.import_all(state)
     M._create_new_docs(state, new_files)
   end
 
-  if changed == 0 and #new_files == 0 then
-    config.log('info', 'No external changes detected (scanned %s)', M._sync_dir)
-  elseif changed > 0 then
-    config.log('info', 'Importing %d changed file(s)', changed)
-  end
+  config.log('info', 'Synced %d document(s) from disk to Overleaf', synced)
 end
 
 --- Scan sync directory for files not tracked by the project
